@@ -1,0 +1,7 @@
+pip>=23.3
+setuptools>=68
+wheel>=0.41
+
+fastapi==0.117.1
+uvicorn[standard]==0.37.0
+youtube-transcript-api==1.2.2
