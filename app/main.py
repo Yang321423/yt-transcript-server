@@ -3,10 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import importlib.metadata
 
-# youtube-transcript-api 1.2.x 기준: 함수들을 직접 import
+# youtube-transcript-api 1.2.x: 인스턴스 + fetch()/list() 사용
 from youtube_transcript_api import (
-    get_transcript,
-    list_transcripts,
+    YouTubeTranscriptApi,
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
@@ -14,21 +13,17 @@ from youtube_transcript_api import (
 
 app = FastAPI(title="YouTube Captions Proxy")
 
-# 개발 단계에서는 * 허용, 운영에서는 실제 도메인으로 제한 권장
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 운영에서는 특정 도메인으로 제한 권장
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 @app.get("/")
 def root():
-    """헬스체크"""
     return {"ok": True}
-
 
 # ---------- 유틸 ----------
 def _format_ts(sec: float) -> str:
@@ -38,9 +33,7 @@ def _format_ts(sec: float) -> str:
     ms = int(round((sec - int(sec)) * 1000))
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-
 def to_srt(items: List[dict]) -> str:
-    """[{text,start,duration}, ...] -> SRT 문자열"""
     lines = []
     for i, it in enumerate(items, start=1):
         start = it.get("start", 0.0)
@@ -53,18 +46,13 @@ def to_srt(items: List[dict]) -> str:
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 
-
 def check_scraping_block(exc: Exception) -> bool:
-    """
-    유튜브 차단(추정) 신호 간단 감지: 429/403 키워드 기반
-    """
     msg = str(exc).lower()
     if "429" in msg or "too many requests" in msg:
         return True
     if "403" in msg or "forbidden" in msg:
         return True
     return False
-
 
 def _detail(user_msg: str, exc: Exception | None, debug: bool, scrapingBlocked: bool) -> str:
     base = user_msg
@@ -73,7 +61,6 @@ def _detail(user_msg: str, exc: Exception | None, debug: bool, scrapingBlocked: 
     if debug and exc is not None:
         base += f" | {type(exc).__name__}: {exc!s}"
     return base
-
 
 # ---------- API ----------
 @app.get("/v1/transcript")
@@ -89,18 +76,21 @@ def api_transcript(
     langs = [x.strip() for x in lang.split(",") if x.strip()]
     scrapingBlocked = False
 
+    api = YouTubeTranscriptApi()
+
     # 1) 요청 언어로 직접 시도
     try:
-        items = get_transcript(videoId, languages=langs)
+        fetched = api.fetch(videoId, languages=langs)  # FetchedTranscript
+        items = fetched.to_raw_data()                  # List[dict]
         if format == "json":
-            return {"videoId": videoId, "lang": langs[0], "items": items, "scrapingBlocked": scrapingBlocked}
+            return {"videoId": videoId, "lang": fetched.language_code, "items": items, "scrapingBlocked": scrapingBlocked}
         else:
             return Response(content=to_srt(items), media_type="text/plain; charset=utf-8")
 
     except NoTranscriptFound:
-        # 2) 목록 열람 후 수동/자동 우선순위 선택
+        # 2) 목록 조회 → 수동/자동 우선순위 반영
         try:
-            tl = list_transcripts(videoId)  # Transcripts 객체
+            tl = api.list(videoId)  # TranscriptList
         except (TranscriptsDisabled, VideoUnavailable) as e:
             scrapingBlocked = check_scraping_block(e)
             raise HTTPException(status_code=404, detail=_detail("Transcript unavailable.", e, debug, scrapingBlocked))
@@ -137,12 +127,12 @@ def api_transcript(
         if not transcript:
             raise HTTPException(status_code=404, detail=_detail("No transcript in requested languages.", None, debug, scrapingBlocked))
 
-        items = transcript.fetch()
+        items = transcript.fetch().to_raw_data()
         if format == "json":
             return {
                 "videoId": videoId,
-                "lang": langs[0],
-                "isTranslated": getattr(transcript, "language_code", "") != langs[0],
+                "lang": transcript.language_code,
+                "isTranslated": transcript.language_code != langs[0],
                 "isGenerated": getattr(transcript, "is_generated", False),
                 "items": items,
                 "scrapingBlocked": scrapingBlocked,
@@ -151,28 +141,24 @@ def api_transcript(
             return Response(content=to_srt(items), media_type="text/plain; charset=utf-8")
 
     except Exception as e:
-        # 기타 예외: 차단 추정 시 429로 매핑
         scrapingBlocked = check_scraping_block(e)
         if scrapingBlocked:
             raise HTTPException(status_code=429, detail=_detail("Rate limited or blocked by YouTube.", e, debug, scrapingBlocked))
         raise HTTPException(status_code=500, detail=_detail("Internal server error.", e, debug, scrapingBlocked))
 
-
 @app.get("/v1/diag")
 def api_diag():
-    """
-    youtube-transcript-api 버전 및 샘플 호출 결과 확인
-    - 설치 버전: yta_version
-    - 샘플 영상 호출 결과: ok / error / scrapingBlocked
-    """
+    """설치 버전 및 샘플 호출 결과 확인"""
     try:
         ver = importlib.metadata.version("youtube-transcript-api")
     except Exception:
         ver = "UNKNOWN"
 
-    test_id = "5MgBikgcWnY"  # CrashCourse (자막 있음으로 알려진 영상)
+    api = YouTubeTranscriptApi()
+    test_id = "5MgBikgcWnY"  # 자막 있는 영상 예시
     try:
-        items = get_transcript(test_id, languages=["en"])
+        fetched = api.fetch(test_id, languages=["en"])
+        items = fetched.to_raw_data()
         return {"ok": True, "yta_version": ver, "sample_items": len(items)}
     except Exception as e:
         blocked = check_scraping_block(e)
